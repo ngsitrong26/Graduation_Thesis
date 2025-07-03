@@ -144,22 +144,29 @@ class LLMInferenceDemo:
         """Switch LoRA adapter using PEFT's load_adapter() and set_adapter() methods"""
         try:
             if lora_id is None:
-                # No LoRA - unload all adapters
+                # No LoRA - unload all adapters to return to base model
                 if (self.current_model and 
                     hasattr(self.current_model, 'peft_config') and 
                     self.current_model.peft_config):
                     self.unload_all_lora()
-                    logger.info("✅ Using base model (no LoRA)")
+                    logger.info("✅ Unloaded all LoRAs, using base model")
                     return "✅ Using base model (no LoRA)"
                 else:
-                    # If no PeftModel exists yet, use base model
-                    self.current_model = self.current_base_model
+                    # If no PeftModel exists yet, just use base model
                     logger.info("✅ Using base model (no LoRA)")
                     return "✅ Using base model (no LoRA)"
             
+            # Validate that this LoRA is for the current base model
+            if self.current_base_model_name:
+                valid_loras = [adapter["id"] for adapter in self.config["lora_adapters"][self.current_base_model_name]]
+                if lora_id not in valid_loras:
+                    error_msg = f"❌ LoRA '{lora_id}' is not compatible with base model '{self.current_base_model_name}'"
+                    logger.error(error_msg)
+                    return error_msg
+            
             # Create PeftModel if it doesn't exist yet
             if not hasattr(self.current_model, 'peft_config'):
-                logger.info("Creating initial PeftModel...")
+                logger.info(f"Creating initial PeftModel with adapter: {lora_name}")
                 self.current_model = PeftModel.from_pretrained(
                     self.current_base_model,
                     lora_id,
@@ -190,10 +197,13 @@ class LLMInferenceDemo:
     def switch_model(self, base_model_name: str, lora_name: str) -> str:
         """Switch to different base model and LoRA combination"""
         try:
-            # Load base model if needed
+            # Check if we need to reload base model
             if self.current_base_model_name != base_model_name:
+                # IMPORTANT: Clear everything when switching base models
+                # to prevent LoRA conflicts between different models
                 self.clear_memory()
                 
+                # Load new base model
                 base_model, tokenizer, load_msg = self.load_base_model(base_model_name)
                 if base_model is None:
                     return load_msg
@@ -201,16 +211,23 @@ class LLMInferenceDemo:
                 self.current_base_model = base_model
                 self.current_tokenizer = tokenizer
                 self.current_base_model_name = base_model_name
-                self.current_model = base_model  # Initialize
+                self.current_model = base_model  # Initialize with base model
+                self.current_lora_name = None  # Reset LoRA state
+                self.loaded_adapters.clear()  # Clear adapter tracking
+                
+                logger.info(f"✅ Base model switched to: {base_model_name}")
             
             # Switch LoRA if needed
             if self.current_lora_name != lora_name:
-                # Find LoRA ID
+                # Find LoRA ID for the CURRENT base model
                 lora_id = None
                 for adapter in self.config["lora_adapters"][base_model_name]:
                     if adapter["name"] == lora_name:
                         lora_id = adapter["id"]
                         break
+                
+                if lora_id is None and lora_name != "Base Model (No LoRA)":
+                    return f"❌ LoRA '{lora_name}' not found for {base_model_name}"
                 
                 # Switch to new LoRA using PEFT methods
                 lora_msg = self.switch_lora_adapter(lora_name, lora_id)
