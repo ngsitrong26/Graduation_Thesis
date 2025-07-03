@@ -40,10 +40,11 @@ class LLMInferenceDemo:
         
         # Model state
         self.current_base_model = None
-        self.current_model = None
+        self.current_model = None  # This will be PeftModel once first LoRA is loaded
         self.current_tokenizer = None
         self.current_base_model_name = None
         self.current_lora_name = None
+        self.loaded_adapters = set()  # Track loaded adapters
         
         # Device setup
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -61,21 +62,61 @@ class LLMInferenceDemo:
 """
         return prompt
     
+    def unload_all_lora(self):
+        """Unload all LoRA adapters using PEFT's unload() method"""
+        if (self.current_model and 
+            hasattr(self.current_model, 'unload') and
+            hasattr(self.current_model, 'peft_config') and
+            self.current_model.peft_config):
+            try:
+                self.current_model.unload()
+                self.loaded_adapters.clear()
+                logger.info("✅ All LoRA adapters unloaded")
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to unload LoRA: {e}")
+    
+    def delete_adapter(self, adapter_name: str):
+        """Delete specific adapter using PEFT's delete_adapter() method"""
+        if (self.current_model and 
+            hasattr(self.current_model, 'delete_adapter') and
+            adapter_name in self.loaded_adapters):
+            try:
+                self.current_model.delete_adapter(adapter_name)
+                self.loaded_adapters.discard(adapter_name)
+                logger.info(f"✅ Adapter '{adapter_name}' deleted")
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to delete adapter {adapter_name}: {e}")
+    
     def clear_memory(self):
-        """Clear GPU memory"""
+        """Clear GPU memory and unload models"""
+        # Unload all LoRA adapters first
+        self.unload_all_lora()
+        
+        # Clear models
         if self.current_model:
             del self.current_model
+            self.current_model = None
+        if self.current_base_model:
+            del self.current_base_model
+            self.current_base_model = None
         if self.current_tokenizer:
             del self.current_tokenizer
+            self.current_tokenizer = None
+            
+        # Reset state
+        self.current_base_model_name = None
+        self.current_lora_name = None
+        self.loaded_adapters.clear()
         
+        # Clear GPU cache
         torch.cuda.empty_cache()
         gc.collect()
+        logger.info("🧹 Memory cleared")
     
     def load_base_model(self, model_name: str) -> tuple:
         """Load base model and tokenizer"""
         try:
             logger.info(f"Loading base model: {model_name}")
-            
             model_id = self.config["base_models"][model_name]
             
             # Load tokenizer
@@ -91,7 +132,7 @@ class LLMInferenceDemo:
                 trust_remote_code=True
             )
             
-            logger.info(f"✅ Base model loaded successfully: {model_name}")
+            logger.info(f"✅ Base model loaded: {model_name}")
             return model, tokenizer, "✅ Model loaded successfully!"
             
         except Exception as e:
@@ -99,41 +140,60 @@ class LLMInferenceDemo:
             logger.error(error_msg)
             return None, None, error_msg
     
-    def load_lora_adapter(self, base_model, lora_id: Optional[str]) -> tuple:
-        """Load LoRA adapter onto base model"""
+    def switch_lora_adapter(self, lora_name: str, lora_id: Optional[str]) -> str:
+        """Switch LoRA adapter using PEFT's load_adapter() and set_adapter() methods"""
         try:
             if lora_id is None:
-                # No LoRA, return base model
-                return base_model, "✅ Using base model (no LoRA)"
+                # No LoRA - unload all adapters
+                if (self.current_model and 
+                    hasattr(self.current_model, 'peft_config') and 
+                    self.current_model.peft_config):
+                    self.unload_all_lora()
+                    logger.info("✅ Using base model (no LoRA)")
+                    return "✅ Using base model (no LoRA)"
+                else:
+                    # If no PeftModel exists yet, use base model
+                    self.current_model = self.current_base_model
+                    logger.info("✅ Using base model (no LoRA)")
+                    return "✅ Using base model (no LoRA)"
             
-            logger.info(f"Loading LoRA adapter: {lora_id}")
+            # Create PeftModel if it doesn't exist yet
+            if not hasattr(self.current_model, 'peft_config'):
+                logger.info("Creating initial PeftModel...")
+                self.current_model = PeftModel.from_pretrained(
+                    self.current_base_model,
+                    lora_id,
+                    adapter_name=lora_name,
+                    torch_dtype=torch.float16
+                )
+                self.loaded_adapters.add(lora_name)
+                logger.info(f"✅ Initial LoRA loaded: {lora_name}")
+                return f"✅ LoRA loaded: {lora_name}"
             
-            # Load LoRA adapter
-            model_with_lora = PeftModel.from_pretrained(
-                base_model,
-                lora_id,
-                torch_dtype=torch.float16
-            )
+            # Check if adapter is already loaded
+            if lora_name not in self.loaded_adapters:
+                logger.info(f"Loading new adapter: {lora_name}")
+                self.current_model.load_adapter(lora_id, adapter_name=lora_name)
+                self.loaded_adapters.add(lora_name)
+                logger.info(f"✅ Adapter loaded: {lora_name}")
             
-            logger.info(f"✅ LoRA adapter loaded successfully: {lora_id}")
-            return model_with_lora, f"✅ LoRA loaded: {lora_id}"
+            # Set as active adapter
+            self.current_model.set_adapter(lora_name)
+            logger.info(f"✅ Active adapter set to: {lora_name}")
+            return f"✅ Switched to LoRA: {lora_name}"
             
         except Exception as e:
-            error_msg = f"❌ Failed to load LoRA {lora_id}: {str(e)}"
+            error_msg = f"❌ Failed to switch LoRA {lora_name}: {str(e)}"
             logger.error(error_msg)
-            return base_model, error_msg
+            return error_msg
     
     def switch_model(self, base_model_name: str, lora_name: str) -> str:
         """Switch to different base model and LoRA combination"""
         try:
-            # Check if we need to reload base model
-            if (self.current_base_model_name != base_model_name or 
-                self.current_base_model is None):
-                
-                # Clear previous model
+            # Load base model if needed
+            if self.current_base_model_name != base_model_name:
                 self.clear_memory()
                 
-                # Load new base model
                 base_model, tokenizer, load_msg = self.load_base_model(base_model_name)
                 if base_model is None:
                     return load_msg
@@ -141,24 +201,25 @@ class LLMInferenceDemo:
                 self.current_base_model = base_model
                 self.current_tokenizer = tokenizer
                 self.current_base_model_name = base_model_name
+                self.current_model = base_model  # Initialize
             
-            # Find LoRA ID
-            lora_adapters = self.config["lora_adapters"][base_model_name]
-            lora_id = None
-            for adapter in lora_adapters:
-                if adapter["name"] == lora_name:
-                    lora_id = adapter["id"]
-                    break
+            # Switch LoRA if needed
+            if self.current_lora_name != lora_name:
+                # Find LoRA ID
+                lora_id = None
+                for adapter in self.config["lora_adapters"][base_model_name]:
+                    if adapter["name"] == lora_name:
+                        lora_id = adapter["id"]
+                        break
+                
+                # Switch to new LoRA using PEFT methods
+                lora_msg = self.switch_lora_adapter(lora_name, lora_id)
+                self.current_lora_name = lora_name
+                
+                status_msg = f"🔄 Switched to: {base_model_name} + {lora_name}\n{lora_msg}"
+            else:
+                status_msg = f"✅ Already using: {base_model_name} + {lora_name}"
             
-            # Load LoRA adapter
-            model_with_lora, lora_msg = self.load_lora_adapter(
-                self.current_base_model, lora_id
-            )
-            
-            self.current_model = model_with_lora
-            self.current_lora_name = lora_name
-            
-            status_msg = f"🔄 Model switched to: {base_model_name} + {lora_name}\n{lora_msg}"
             logger.info(status_msg)
             return status_msg
             
@@ -216,7 +277,6 @@ class LLMInferenceDemo:
             
             # Extract only the response part
             response = generated_text[len(prompt):].strip()
-            
             return response
             
         except Exception as e:
